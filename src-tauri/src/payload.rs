@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::config;
 use crate::log::dlog;
+use crate::shell;
 
 const PAYLOAD: &[u8] = include_bytes!("../resources/app-payload.zip");
 const EXPECTED_HASH: &str = env!("PAYLOAD_SHA256");
@@ -10,6 +11,7 @@ const EXPECTED_HASH: &str = env!("PAYLOAD_SHA256");
 const MAX_ZIP_ENTRIES: usize = 10_000;
 const MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
 
+/// Extracts the embedded app-payload.zip (initial install).
 pub fn extract() -> Result<(), Box<dyn std::error::Error>> {
     dlog!("payload::extract: payload size={} bytes", PAYLOAD.len());
 
@@ -24,9 +26,87 @@ pub fn extract() -> Result<(), Box<dyn std::error::Error>> {
     }
     dlog!("payload::extract: integrity check passed");
 
-    let cursor = std::io::Cursor::new(PAYLOAD);
+    extract_zip(PAYLOAD)
+}
+
+pub fn download_and_install_update() -> Result<(), Box<dyn std::error::Error>> {
+    dlog!("update: downloading payload and signature");
+
+    let zip_path = shell::csprng_temp_path("zip")?;
+    let sig_path = shell::csprng_temp_path("sig")?;
+
+    let result = download_verify_and_extract(&zip_path, &sig_path);
+
+    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_file(&sig_path);
+
+    result
+}
+
+fn download_verify_and_extract(
+    zip_path: &Path,
+    sig_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ed25519_dalek::Verifier;
+    use libcrux_ml_dsa::ml_dsa_87;
+
+    let zip_url = format!("{}/update-payload.zip", config::RELEASE_DOWNLOAD_URL);
+    let sig_url = format!("{}/update-payload.zip.sig", config::RELEASE_DOWNLOAD_URL);
+
+    shell::download(&zip_url, zip_path)?;
+    shell::download(&sig_url, sig_path)?;
+    dlog!("update: downloads complete");
+
+    let sig_content = std::fs::read_to_string(sig_path)?;
+    let lines: Vec<&str> = sig_content.lines().collect();
+    if lines.len() != 3 {
+        return Err("Invalid signature file format".into());
+    }
+
+    let expected_hash_hex = lines[0].trim();
+    let ed25519_sig_hex = lines[1].trim();
+    let mldsa_sig_hex = lines[2].trim();
+
+    let payload = std::fs::read(zip_path)?;
+    let actual_hash = blake3::hash(&payload);
+    let actual_hash_hex = actual_hash.to_hex();
+    if actual_hash_hex.as_str() != expected_hash_hex {
+        return Err("Payload integrity check failed".into());
+    }
+    let digest_bytes = actual_hash.as_bytes();
+    dlog!("update: BLAKE3 hash verified");
+
+    let ed_sig_bytes: [u8; 64] = hex::decode(ed25519_sig_hex)?
+        .try_into()
+        .map_err(|_| "Ed25519 signature must be exactly 64 bytes")?;
+    let ed_verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&config::ED25519_PUBLIC_KEY)?;
+    let ed_signature = ed25519_dalek::Signature::from_bytes(&ed_sig_bytes);
+    ed_verifying_key
+        .verify(digest_bytes, &ed_signature)
+        .map_err(|_| "Ed25519 signature verification failed")?;
+    dlog!("update: Ed25519 signature verified");
+
+    let mldsa_sig_bytes = hex::decode(mldsa_sig_hex)?;
+    let mut mldsa_vk = ml_dsa_87::MLDSA87VerificationKey::zero();
+    mldsa_vk
+        .as_mut_slice()
+        .copy_from_slice(&config::MLDSA87_PUBLIC_KEY);
+    let mut mldsa_sig = ml_dsa_87::MLDSA87Signature::zero();
+    if mldsa_sig_bytes.len() != mldsa_sig.as_slice().len() {
+        return Err("ML-DSA-87 signature size mismatch".into());
+    }
+    mldsa_sig.as_mut_slice().copy_from_slice(&mldsa_sig_bytes);
+    ml_dsa_87::verify(&mldsa_vk, digest_bytes, b"", &mldsa_sig)
+        .map_err(|_| "ML-DSA-87 signature verification failed")?;
+    dlog!("update: ML-DSA-87 signature verified");
+
+    extract_zip(&payload)
+}
+
+fn extract_zip(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let cursor = std::io::Cursor::new(payload);
     let mut archive = zip::ZipArchive::new(cursor)?;
-    dlog!("payload::extract: zip contains {} entries", archive.len());
+    dlog!("payload: zip contains {} entries", archive.len());
 
     if archive.len() > MAX_ZIP_ENTRIES {
         return Err(format!(
@@ -43,16 +123,13 @@ pub fn extract() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if install_dir.exists() {
-        dlog!(
-            "payload::extract: removing existing {}",
-            config::INSTALL_DIR
-        );
+        dlog!("payload: removing existing {}", config::INSTALL_DIR);
         safe_remove_dir(install_dir)?;
     }
     std::fs::create_dir_all(install_dir)?;
     verify_not_reparse_point(install_dir)?;
 
-    dlog!("payload::extract: created {}", config::INSTALL_DIR);
+    dlog!("payload: created {}", config::INSTALL_DIR);
 
     let mut total_extracted: u64 = 0;
 
@@ -86,7 +163,7 @@ pub fn extract() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    dlog!("payload::extract: all files extracted ({total_extracted} bytes total)");
+    dlog!("payload: all files extracted ({total_extracted} bytes total)");
     Ok(())
 }
 
