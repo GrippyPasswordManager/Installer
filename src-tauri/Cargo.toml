@@ -1,0 +1,36 @@
+[package]
+name = "Grippy-installer"
+version = "0.1.0"
+description = "Grippy Installer"
+authors = ["Xoifail"]
+edition = "2024"
+
+[lib]
+name = "grippy_installer"
+crate-type = ["lib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+sha2 = "0.10"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+zip = { version = "7", default-features = false, features = ["deflate"] }
+winreg = "0.55"
+sha2 = "0.10"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

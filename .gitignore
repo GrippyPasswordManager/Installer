@@ -1,0 +1,4 @@
+node_modules/
+target/
+dist/
+src-tauri/resources/app-payload.zip

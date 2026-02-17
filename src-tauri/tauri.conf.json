@@ -1,0 +1,28 @@
+{
+  "productName": "Grippy Installer",
+  "version": "0.1.0",
+  "identifier": "com.Grippy.installer",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Grippy Installer",
+        "url": "index.html",
+        "width": 660,
+        "height": 180,
+        "resizable": false,
+        "decorations": false,
+        "center": true,
+        "transparent": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": []
+  }
+}
