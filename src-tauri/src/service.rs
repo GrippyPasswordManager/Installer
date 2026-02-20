@@ -1,13 +1,9 @@
 use std::os::windows::process::CommandExt;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::config;
 use crate::log::dlog;
 use crate::shell;
-
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
-const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn is_service_gone() -> bool {
     let output = shell::system32_command("sc.exe")
@@ -33,12 +29,14 @@ fn is_service_stopped() -> bool {
 }
 
 fn wait_until(condition: impl Fn() -> bool) -> bool {
+    let timeout = Duration::from_secs(config::SERVICE_TEARDOWN_TIMEOUT_SECS);
+    let poll_interval = Duration::from_millis(config::SERVICE_POLL_INTERVAL_MS);
     let start = Instant::now();
-    while start.elapsed() < TEARDOWN_TIMEOUT {
+    while start.elapsed() < timeout {
         if condition() {
             return true;
         }
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(poll_interval);
     }
     false
 }
@@ -62,10 +60,7 @@ pub fn teardown_existing() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn register_and_start() -> Result<(), Box<dyn std::error::Error>> {
-    let bin_path = Path::new(config::INSTALL_DIR)
-        .join(config::SERVICE_BIN)
-        .to_string_lossy()
-        .into_owned();
+    let bin_path = config::service_path().to_string_lossy().into_owned();
 
     dlog!("service::register_and_start: creating service, binPath={bin_path}");
 
@@ -74,6 +69,7 @@ pub fn register_and_start() -> Result<(), Box<dyn std::error::Error>> {
     cmd.raw_arg(config::SERVICE_NAME);
     cmd.raw_arg(format!("binPath= \"{}\"", bin_path));
     cmd.raw_arg("start= auto");
+    cmd.raw_arg("obj= \"NT AUTHORITY\\LocalService\"");
     cmd.raw_arg(format!("DisplayName= \"{}\"", config::SERVICE_DISPLAY_NAME));
 
     let create = cmd.output()?;
@@ -103,11 +99,17 @@ pub fn register_and_start() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let failure_reset = format!("reset= {}", config::SERVICE_FAILURE_RESET_SECS);
+    let failure_actions = format!(
+        "actions= restart/{}/restart/{}//",
+        config::SERVICE_FIRST_FAILURE_RESTART_MS,
+        config::SERVICE_SECOND_FAILURE_RESTART_MS
+    );
     let mut fail = shell::system32_command("sc.exe");
     fail.raw_arg("failure");
     fail.raw_arg(config::SERVICE_NAME);
-    fail.raw_arg("reset= 86400");
-    fail.raw_arg("actions= restart/5000/restart/10000//");
+    fail.raw_arg(failure_reset);
+    fail.raw_arg(failure_actions);
     if let Ok(o) = fail.output() {
         if !o.status.success() {
             dlog!(

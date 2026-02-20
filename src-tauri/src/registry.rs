@@ -4,10 +4,8 @@ use crate::config;
 use crate::log::dlog;
 
 fn install_size_kb() -> u32 {
-    const MAX_DEPTH: u32 = 32;
-
-    fn dir_size(path: &Path, depth: u32) -> u64 {
-        if depth >= MAX_DEPTH {
+    fn dir_size(path: &Path, remaining_depth: u32) -> u64 {
+        if remaining_depth == 0 {
             return 0;
         }
         let mut total = 0;
@@ -15,7 +13,7 @@ fn install_size_kb() -> u32 {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    total += dir_size(&path, depth + 1);
+                    total += dir_size(&path, remaining_depth - 1);
                 } else if let Ok(meta) = path.metadata() {
                     total += meta.len();
                 }
@@ -23,29 +21,16 @@ fn install_size_kb() -> u32 {
         }
         total
     }
-    (dir_size(Path::new(config::INSTALL_DIR), 0) / 1024) as u32
+    (dir_size(config::install_dir(), config::MAX_DIRECTORY_DEPTH) / 1024) as u32
 }
 
 fn today_yyyymmdd() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
-    let days = (secs / 86400) as i64;
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    format!("{y}{m:02}{d:02}")
+    let date = crate::log::civil_date_from_epoch_secs(secs);
+    format!("{}{:02}{:02}", date.year, date.month, date.day)
 }
 
 pub fn register_uninstaller() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,7 +38,7 @@ pub fn register_uninstaller() -> Result<(), Box<dyn std::error::Error>> {
     use winreg::enums::*;
 
     let self_exe = std::env::current_exe()?;
-    let installer_dest = Path::new(config::INSTALL_DIR).join(config::INSTALLER_BIN);
+    let installer_dest = config::installer_path();
     dlog!(
         "registry::register_uninstaller: copying {} -> {}",
         self_exe.display(),
@@ -68,9 +53,8 @@ pub fn register_uninstaller() -> Result<(), Box<dyn std::error::Error>> {
         config::UNINSTALL_REG_PATH
     );
 
-    let app_icon = Path::new(config::INSTALL_DIR).join(config::APP_BIN);
+    let app_icon = config::app_path();
     let uninstall_string = format!(r#""{}" --uninstall"#, installer_dest.to_string_lossy());
-    let quiet_uninstall_string = format!(r#""{}" --uninstall"#, installer_dest.to_string_lossy());
     let size_kb = install_size_kb();
     let date = today_yyyymmdd();
 
@@ -79,7 +63,7 @@ pub fn register_uninstaller() -> Result<(), Box<dyn std::error::Error>> {
     key.set_value("Publisher", &config::PUBLISHER)?;
     key.set_value("InstallLocation", &config::INSTALL_DIR)?;
     key.set_value("UninstallString", &uninstall_string)?;
-    key.set_value("QuietUninstallString", &quiet_uninstall_string)?;
+    key.set_value("QuietUninstallString", &uninstall_string)?;
     key.set_value("DisplayIcon", &app_icon.to_string_lossy().as_ref())?;
     key.set_value("EstimatedSize", &size_kb)?;
     key.set_value("InstallDate", &date)?;

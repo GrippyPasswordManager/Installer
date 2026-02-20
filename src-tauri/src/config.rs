@@ -1,30 +1,68 @@
-// Paths
 pub const INSTALL_DIR: &str = r"C:\Program Files\Grippy";
 pub const APP_BIN: &str = "Grippy-desktop.exe";
 pub const SERVICE_BIN: &str = "Grippy-posture-service.exe";
 pub const INSTALLER_BIN: &str = "Grippy-installer.exe";
 
-// App metadata
 pub const APP_NAME: &str = "Grippy";
 pub const APP_VERSION: &str = "0.1.0";
 pub const PUBLISHER: &str = "Grippy";
 
-// Windows service
 pub const SERVICE_NAME: &str = "GrippyPosture";
 pub const SERVICE_DISPLAY_NAME: &str = "Grippy Posture Service";
 pub const SERVICE_DESCRIPTION: &str = "Evaluates system security posture for Grippy";
+pub const SERVICE_POLL_INTERVAL_MS: u64 = 250;
+pub const SERVICE_TEARDOWN_TIMEOUT_SECS: u64 = 10;
+pub const SERVICE_FAILURE_RESET_SECS: u32 = 86400;
+pub const SERVICE_FIRST_FAILURE_RESTART_MS: u32 = 5000;
+pub const SERVICE_SECOND_FAILURE_RESTART_MS: u32 = 10000;
 
-// Prerequisites
 pub const VCREDIST_URL: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+pub const VCREDIST_EXIT_ALREADY_INSTALLED: i32 = 1638;
+pub const VCREDIST_EXIT_REBOOT_REQUIRED: i32 = 3010;
+pub const VCREDIST_MIN_MAJOR_VERSION: u32 = 14;
+
 pub const WEBVIEW2_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+pub const WEBVIEW2_RUNTIME_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+pub const WEBVIEW2_NULL_VERSION: &str = "0.0.0.0";
+
 pub const MICROSOFT_SIGNER: &str = "Microsoft Corporation";
 
-// Shortcuts
 pub const DESKTOP_LNK: &str = r"C:\Users\Public\Desktop\Grippy.lnk";
 pub const START_MENU_LNK: &str = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Grippy.lnk";
 
-// Registry
 pub const UNINSTALL_REG_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Grippy";
-
-// Uninstall self delete delay (seconds)
 pub const SELF_DELETE_DELAY_SECS: u32 = 2;
+
+pub const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
+pub const DOWNLOAD_INITIAL_BACKOFF_MS: u64 = 1000;
+pub const CURL_MAX_REDIRECTS: &str = "5";
+pub const TEMP_FILE_PREFIX: &str = "grippy_";
+
+pub const MAX_ZIP_ENTRIES: usize = 10_000;
+pub const MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_DIRECTORY_DEPTH: u32 = 64;
+
+pub const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_LOG_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+pub const SANITIZE_MAX_LENGTH: usize = 4096;
+
+pub const KILL_APP_SETTLE_MS: u64 = 500;
+pub const LAUNCH_SETTLE_MS: u64 = 300;
+
+use std::path::{Path, PathBuf};
+
+pub fn install_dir() -> &'static Path {
+    Path::new(INSTALL_DIR)
+}
+
+pub fn app_path() -> PathBuf {
+    install_dir().join(APP_BIN)
+}
+
+pub fn service_path() -> PathBuf {
+    install_dir().join(SERVICE_BIN)
+}
+
+pub fn installer_path() -> PathBuf {
+    install_dir().join(INSTALLER_BIN)
+}

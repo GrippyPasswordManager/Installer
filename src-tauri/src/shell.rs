@@ -1,11 +1,33 @@
+use std::fs::File;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config;
+use crate::log::dlog;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const FILE_SHARE_READ: u32 = 0x00000001;
+
+pub struct LockedTempFile {
+    path: PathBuf,
+    lock: Option<File>,
+}
+
+impl LockedTempFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for LockedTempFile {
+    fn drop(&mut self) {
+        self.lock.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 fn system32_dir() -> PathBuf {
     #[link(name = "kernel32")]
@@ -71,48 +93,84 @@ pub fn powershell_run_ignore(args: &[&str]) {
 
 pub fn download(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let out = dest.to_string_lossy();
+    let mut last_error = String::new();
+    let mut backoff_ms = config::DOWNLOAD_INITIAL_BACKOFF_MS;
 
-    let status = system32_command("curl.exe")
-        .args([
-            "--tlsv1.2",
-            "--proto",
-            "=https",
-            "-L",
-            "--max-redirs",
-            "5",
-            "-o",
-            &*out,
-            url,
-        ])
-        .status()?;
+    for attempt in 1..=config::DOWNLOAD_MAX_ATTEMPTS {
+        let result = system32_command("curl.exe")
+            .args([
+                "--tlsv1.2",
+                "--proto",
+                "=https",
+                "-L",
+                "--max-redirs",
+                config::CURL_MAX_REDIRECTS,
+                "-o",
+                &*out,
+                url,
+            ])
+            .status();
 
-    if !status.success() {
-        let _ = std::fs::remove_file(dest);
-        return Err(format!("Download failed (exit {:?}): {url}", status.code()).into());
+        match result {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = format!("curl exited {:?}", status.code());
+            }
+            Err(e) => {
+                last_error = e.to_string();
+            }
+        }
+
+        if attempt < config::DOWNLOAD_MAX_ATTEMPTS {
+            dlog!(
+                "download attempt {}/{} failed ({}), retrying in {backoff_ms}ms",
+                attempt,
+                config::DOWNLOAD_MAX_ATTEMPTS,
+                last_error,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            backoff_ms *= 2;
+        }
     }
-    Ok(())
+
+    let _ = std::fs::remove_file(dest);
+    Err(format!(
+        "Download failed after {} attempts: {url} ({last_error})",
+        config::DOWNLOAD_MAX_ATTEMPTS
+    )
+    .into())
 }
 
-/// Downloads a file and verifies its Authenticode signature (full chain + revocation).
-/// Microsoft does not publish SHA-256 hashes for redistributable downloads, so
-/// Authenticode is the only integrity mechanism available:
-///   https://learn.microsoft.com/en-us/answers/questions/1614247
-///   https://techcommunity.microsoft.com/discussions/edgeinsiderdiscussions/microsoft-webview2-hash-for-file-integrity/4073392
-pub fn download_and_verify(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    download(url, dest)?;
-    if let Err(e) = verify_authenticode(dest, config::MICROSOFT_SIGNER) {
-        let _ = std::fs::remove_file(dest);
+pub fn download_and_verify(
+    url: &str,
+    extension: &str,
+) -> Result<LockedTempFile, Box<dyn std::error::Error>> {
+    let path = csprng_temp_path(extension)?;
+    download(url, &path)?;
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)?;
+
+    if let Err(e) = verify_authenticode(&path, config::MICROSOFT_SIGNER) {
+        drop(lock);
+        let _ = std::fs::remove_file(&path);
         return Err(e);
     }
-    Ok(())
+
+    Ok(LockedTempFile {
+        path,
+        lock: Some(lock),
+    })
 }
 
-pub fn csprng_temp_path(extension: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn csprng_temp_path(extension: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut bytes = [0u8; 16];
     csprng_fill(&mut bytes)?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let path = std::env::temp_dir().join(format!("fv_{hex}.{extension}"));
-    std::fs::File::create_new(&path)?;
+    let path = std::env::temp_dir().join(format!("{}{hex}.{extension}", config::TEMP_FILE_PREFIX));
+    File::create_new(&path)?;
     Ok(path)
 }
 
@@ -176,8 +234,7 @@ pub fn verify_authenticode(
     const WTD_STATEACTION_CLOSE: u32 = 2;
     const WTD_REVOCATION_CHECK_CHAIN: u32 = 0x40;
 
-    // WINTRUST_ACTION_GENERIC_VERIFY_V2 {00AAC56B-CD44-11d0-8CC2-00C04FC295EE}
-    let mut action_id: [u8; 16] = [
+    let mut wintrust_action_generic_verify_v2: [u8; 16] = [
         0x6B, 0xC5, 0xAA, 0x00, 0x44, 0xCD, 0xD0, 0x11, 0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95,
         0xEE,
     ];
@@ -211,7 +268,8 @@ pub fn verify_authenticode(
         signature_settings: 0,
     };
 
-    let result = unsafe { WinVerifyTrust(-1, &mut action_id, &mut trust_data) };
+    let result =
+        unsafe { WinVerifyTrust(-1, &mut wintrust_action_generic_verify_v2, &mut trust_data) };
 
     let signer_result = if result == 0 {
         verify_signer_name(trust_data.state_data, expected_signer)
@@ -221,7 +279,7 @@ pub fn verify_authenticode(
 
     trust_data.state_action = WTD_STATEACTION_CLOSE;
     unsafe {
-        WinVerifyTrust(-1, &mut action_id, &mut trust_data);
+        WinVerifyTrust(-1, &mut wintrust_action_generic_verify_v2, &mut trust_data);
     }
 
     if result != 0 {

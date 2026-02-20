@@ -11,7 +11,7 @@ pub fn create() -> Result<(), Box<dyn std::error::Error>> {
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
     use windows::core::{HSTRING, Interface, PCWSTR};
 
-    let target = Path::new(config::INSTALL_DIR).join(config::APP_BIN);
+    let target = config::app_path();
     let target_str = target.to_string_lossy();
     dlog!("shortcuts::create: target={target_str}");
 

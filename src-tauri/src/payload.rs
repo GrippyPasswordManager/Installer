@@ -7,9 +7,6 @@ use crate::log::dlog;
 const PAYLOAD: &[u8] = include_bytes!("../resources/app-payload.zip");
 const EXPECTED_HASH: &str = env!("PAYLOAD_SHA256");
 
-const MAX_ZIP_ENTRIES: usize = 10_000;
-const MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
-
 pub fn extract() -> Result<(), Box<dyn std::error::Error>> {
     dlog!("payload::extract: payload size={} bytes", PAYLOAD.len());
 
@@ -27,15 +24,109 @@ pub fn extract() -> Result<(), Box<dyn std::error::Error>> {
     extract_zip(PAYLOAD)
 }
 
+struct DirectoryGuard {
+    handle: isize,
+}
+
+impl DirectoryGuard {
+    fn open_pinned(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *const u8,
+                disposition: u32,
+                flags: u32,
+                template: isize,
+            ) -> isize;
+            fn GetFileInformationByHandle(handle: isize, info: *mut ByHandleFileInfo) -> i32;
+        }
+
+        const INVALID_HANDLE: isize = -1;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const FILE_SHARE_READ: u32 = 1;
+        const FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const ATTR_REPARSE_POINT: u32 = 0x400;
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FLAG_OPEN_REPARSE_POINT | FLAG_BACKUP_SEMANTICS,
+                0,
+            )
+        };
+
+        if handle == INVALID_HANDLE {
+            return Err(format!("Failed to open {} for reparse check", path.display()).into());
+        }
+
+        #[repr(C)]
+        struct ByHandleFileInfo {
+            attributes: u32,
+            _pad: [u32; 12],
+        }
+
+        let mut info: ByHandleFileInfo = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(handle, &mut info as *mut _ as *mut _) };
+
+        if ok == 0 {
+            unsafe { close_handle(handle) };
+            return Err(format!("Failed to query attributes for {}", path.display()).into());
+        }
+
+        if info.attributes & ATTR_REPARSE_POINT != 0 {
+            unsafe { close_handle(handle) };
+            return Err(format!("{} is a reparse point", path.display()).into());
+        }
+
+        Ok(DirectoryGuard { handle })
+    }
+}
+
+impl Drop for DirectoryGuard {
+    fn drop(&mut self) {
+        unsafe { close_handle(self.handle) };
+    }
+}
+
+unsafe fn close_handle(handle: isize) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    unsafe { CloseHandle(handle) };
+}
+
+fn verify_not_reparse_point(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let guard = DirectoryGuard::open_pinned(path)?;
+    drop(guard);
+    Ok(())
+}
+
 fn extract_zip(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let cursor = std::io::Cursor::new(payload);
     let mut archive = zip::ZipArchive::new(cursor)?;
     dlog!("payload: zip contains {} entries", archive.len());
 
-    if archive.len() > MAX_ZIP_ENTRIES {
+    if archive.len() > config::MAX_ZIP_ENTRIES {
         return Err(format!(
-            "Archive contains {} entries, exceeding limit of {MAX_ZIP_ENTRIES}",
-            archive.len()
+            "Archive contains {} entries, exceeding limit of {}",
+            archive.len(),
+            config::MAX_ZIP_ENTRIES,
         )
         .into());
     }
@@ -51,10 +142,11 @@ fn extract_zip(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         safe_remove_dir(install_dir)?;
     }
     std::fs::create_dir_all(install_dir)?;
-    verify_not_reparse_point(install_dir)?;
 
-    dlog!("payload: created {}", config::INSTALL_DIR);
+    let _install_dir_guard = DirectoryGuard::open_pinned(install_dir)?;
+    dlog!("payload: created and pinned {}", config::INSTALL_DIR);
 
+    let mut pinned_dirs: Vec<DirectoryGuard> = Vec::new();
     let mut total_extracted: u64 = 0;
 
     for i in 0..archive.len() {
@@ -63,10 +155,12 @@ fn extract_zip(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         total_extracted = total_extracted
             .checked_add(file.size())
             .ok_or("Extracted size overflow")?;
-        if total_extracted > MAX_EXTRACTED_BYTES {
-            return Err(
-                format!("Extracted size exceeds {} byte limit", MAX_EXTRACTED_BYTES).into(),
-            );
+        if total_extracted > config::MAX_EXTRACTED_BYTES {
+            return Err(format!(
+                "Extracted size exceeds {} byte limit",
+                config::MAX_EXTRACTED_BYTES
+            )
+            .into());
         }
 
         let out_path = match file.enclosed_name() {
@@ -76,11 +170,13 @@ fn extract_zip(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
 
         if file.is_dir() {
             std::fs::create_dir_all(&out_path)?;
-            verify_not_reparse_point(&out_path)?;
+            pinned_dirs.push(DirectoryGuard::open_pinned(&out_path)?);
         } else {
             if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-                verify_not_reparse_point(parent)?;
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                    pinned_dirs.push(DirectoryGuard::open_pinned(parent)?);
+                }
             }
             let mut dest = std::fs::File::create(&out_path)?;
             std::io::copy(&mut file, &mut dest)?;
@@ -91,84 +187,8 @@ fn extract_zip(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn verify_not_reparse_point(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateFileW(
-            name: *const u16,
-            access: u32,
-            share: u32,
-            security: *const u8,
-            disposition: u32,
-            flags: u32,
-            template: isize,
-        ) -> isize;
-        fn GetFileInformationByHandle(handle: isize, info: *mut ByHandleFileInfo) -> i32;
-        fn CloseHandle(handle: isize) -> i32;
-    }
-
-    #[repr(C)]
-    struct ByHandleFileInfo {
-        attributes: u32,
-        _creation_time: [u32; 2],
-        _last_access_time: [u32; 2],
-        _last_write_time: [u32; 2],
-        _volume_serial: u32,
-        _size_high: u32,
-        _size_low: u32,
-        _num_links: u32,
-        _index_high: u32,
-        _index_low: u32,
-    }
-
-    const INVALID_HANDLE: isize = -1;
-    const OPEN_EXISTING: u32 = 3;
-    const FILE_READ_ATTRIBUTES: u32 = 0x80;
-    const FILE_SHARE_READ_WRITE_DELETE: u32 = 7;
-    const FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const ATTR_REPARSE_POINT: u32 = 0x400;
-
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ_WRITE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FLAG_OPEN_REPARSE_POINT | FLAG_BACKUP_SEMANTICS,
-            0,
-        )
-    };
-
-    if handle == INVALID_HANDLE {
-        return Err(format!("Failed to open {} for reparse check", path.display()).into());
-    }
-
-    let mut info: ByHandleFileInfo = unsafe { std::mem::zeroed() };
-    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
-    unsafe { CloseHandle(handle) };
-
-    if ok == 0 {
-        return Err(format!("Failed to query handle attributes for {}", path.display()).into());
-    }
-
-    if info.attributes & ATTR_REPARSE_POINT != 0 {
-        return Err(format!("{} is a reparse point", path.display()).into());
-    }
-
-    Ok(())
-}
-
 pub fn safe_remove_dir(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    const MAX_DEPTH: u32 = 64;
-    remove_dir_recursive(dir, MAX_DEPTH)
+    remove_dir_recursive(dir, config::MAX_DIRECTORY_DEPTH)
 }
 
 fn remove_dir_recursive(

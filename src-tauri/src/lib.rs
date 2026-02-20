@@ -8,7 +8,6 @@ mod shell;
 mod shortcuts;
 
 use log::dlog;
-use std::path::Path;
 use tauri::Emitter;
 
 pub fn is_elevated() -> bool {
@@ -143,7 +142,24 @@ pub fn show_error_msgbox(msg: &str) {
     }
 }
 
-static INSTALL_MUTEX: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+struct OwnedMutex(isize);
+
+impl Drop for OwnedMutex {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+unsafe impl Send for OwnedMutex {}
+unsafe impl Sync for OwnedMutex {}
+
+static INSTALL_MUTEX: std::sync::OnceLock<OwnedMutex> = std::sync::OnceLock::new();
 
 fn acquire_install_mutex() -> Result<(), String> {
     #[repr(C)]
@@ -178,15 +194,8 @@ fn acquire_install_mutex() -> Result<(), String> {
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const SDDL_REVISION_1: u32 = 1;
 
-    let name: Vec<u16> = "Global\\GrippyInstaller"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;SY)"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let name = windows::core::w!("Global\\GrippyInstaller");
+    let sddl = windows::core::w!("D:(A;;GA;;;BA)(A;;GA;;;SY)");
 
     unsafe {
         let mut sd: *mut u8 = std::ptr::null_mut();
@@ -222,20 +231,17 @@ fn acquire_install_mutex() -> Result<(), String> {
             dlog!("acquire_install_mutex: mutex already held, another install in progress");
             return Err("Another installation is already in progress.".into());
         }
-        let _ = INSTALL_MUTEX.set(handle);
+        let _ = INSTALL_MUTEX.set(OwnedMutex(handle));
         dlog!("acquire_install_mutex: acquired with restricted ACL");
     }
     Ok(())
 }
 
 fn allowlist_cfa() {
-    let service_path = Path::new(config::INSTALL_DIR).join(config::SERVICE_BIN);
-    let app_path = Path::new(config::INSTALL_DIR).join(config::APP_BIN);
-
     let arg = format!(
         "Add-MpPreference -ControlledFolderAccessAllowedApplications {},{} -ErrorAction SilentlyContinue",
-        shell::ps_single_quote(&service_path.to_string_lossy()),
-        shell::ps_single_quote(&app_path.to_string_lossy()),
+        shell::ps_single_quote(&config::service_path().to_string_lossy()),
+        shell::ps_single_quote(&config::app_path().to_string_lossy()),
     );
 
     dlog!("allowlist_cfa: {arg}");
@@ -248,19 +254,47 @@ fn emit_progress(app: &tauri::AppHandle, msg: &str) {
 }
 
 fn kill_running_app() {
-    let app_path = Path::new(config::INSTALL_DIR).join(config::APP_BIN);
+    let app_path = config::app_path();
     dlog!("kill_running_app: killing {}", app_path.display());
     let script = format!(
         "Get-Process | Where-Object {{ $_.Path -eq {} }} | Stop-Process -Force -ErrorAction SilentlyContinue",
         shell::ps_single_quote(&app_path.to_string_lossy())
     );
     shell::powershell_run_ignore(&["-NoProfile", "-Command", &script]);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_millis(config::KILL_APP_SETTLE_MS));
 }
 
 #[tauri::command]
 fn log_js_error(msg: String) {
     dlog!("JS ERROR: {}", log::sanitize(&msg));
+}
+
+fn fail_install<T>(
+    result: Result<T, Box<dyn std::error::Error>>,
+    user_message: &str,
+) -> Result<T, String> {
+    result.map_err(|e| {
+        dlog!("{user_message}: {e}");
+        user_message.into()
+    })
+}
+
+fn check_prerequisite(
+    app: &tauri::AppHandle,
+    result: Result<bool, Box<dyn std::error::Error>>,
+    found_msg: &str,
+    installed_msg: &str,
+) -> Result<(), String> {
+    let already_present = fail_install(result, "Failed to install required components.")?;
+    emit_progress(
+        app,
+        if already_present {
+            found_msg
+        } else {
+            installed_msg
+        },
+    );
+    Ok(())
 }
 
 struct InstallGuard {
@@ -311,7 +345,7 @@ impl Drop for InstallGuard {
         }
         if self.extracted_files {
             dlog!("rollback: removing installed files");
-            if let Err(e) = payload::safe_remove_dir(Path::new(config::INSTALL_DIR)) {
+            if let Err(e) = payload::safe_remove_dir(config::install_dir()) {
                 dlog!("rollback: safe_remove_dir failed: {e}");
             }
         }
@@ -332,42 +366,26 @@ async fn install(app: tauri::AppHandle) -> Result<(), String> {
     acquire_install_mutex()?;
 
     emit_progress(&app, "Checking C++ Runtime...");
-    match prerequisites::ensure_vcredist() {
-        Ok(found) => {
-            let msg = if found {
-                "C++ Runtime found"
-            } else {
-                "C++ Runtime installed"
-            };
-            emit_progress(&app, msg);
-        }
-        Err(e) => {
-            dlog!("VC++ Runtime setup failed: {e}");
-            return Err("Failed to install required components.".into());
-        }
-    }
+    check_prerequisite(
+        &app,
+        prerequisites::ensure_vcredist(),
+        "C++ Runtime found",
+        "C++ Runtime installed",
+    )?;
 
     emit_progress(&app, "Checking WebView2...");
-    match prerequisites::ensure_webview2() {
-        Ok(found) => {
-            let msg = if found {
-                "WebView2 found"
-            } else {
-                "WebView2 installed"
-            };
-            emit_progress(&app, msg);
-        }
-        Err(e) => {
-            dlog!("WebView2 setup failed: {e}");
-            return Err("Failed to install required components.".into());
-        }
-    }
+    check_prerequisite(
+        &app,
+        prerequisites::ensure_webview2(),
+        "WebView2 found",
+        "WebView2 installed",
+    )?;
 
     emit_progress(&app, "Preparing installation...");
-    service::teardown_existing().map_err(|e| {
-        dlog!("Service teardown failed: {e}");
-        String::from("Failed to prepare for installation.")
-    })?;
+    fail_install(
+        service::teardown_existing(),
+        "Failed to prepare for installation.",
+    )?;
     dlog!("Service teardown complete");
 
     kill_running_app();
@@ -375,10 +393,7 @@ async fn install(app: tauri::AppHandle) -> Result<(), String> {
     let mut guard = InstallGuard::new();
 
     emit_progress(&app, "Extracting files...");
-    if let Err(e) = payload::extract() {
-        dlog!("Extract failed: {e}");
-        return Err("Failed to extract application files.".into());
-    }
+    fail_install(payload::extract(), "Failed to extract application files.")?;
     guard.extracted_files = true;
     dlog!("Payload extracted to {}", config::INSTALL_DIR);
 
@@ -386,26 +401,23 @@ async fn install(app: tauri::AppHandle) -> Result<(), String> {
     guard.added_cfa_allowlist = true;
 
     emit_progress(&app, "Starting service...");
-    if let Err(e) = service::register_and_start() {
-        dlog!("Service registration failed: {e}");
-        return Err("Failed to configure application service.".into());
-    }
+    fail_install(
+        service::register_and_start(),
+        "Failed to configure application service.",
+    )?;
     guard.registered_service = true;
     dlog!("Service registered and started");
 
     emit_progress(&app, "Creating shortcuts...");
-    if let Err(e) = shortcuts::create() {
-        dlog!("Shortcut creation failed: {e}");
-        return Err("Failed to create shortcuts.".into());
-    }
+    fail_install(shortcuts::create(), "Failed to create shortcuts.")?;
     guard.created_shortcuts = true;
     dlog!("Shortcuts created");
 
     emit_progress(&app, "Finalizing...");
-    if let Err(e) = registry::register_uninstaller() {
-        dlog!("Registry failed: {e}");
-        return Err("Failed to finalize installation.".into());
-    }
+    fail_install(
+        registry::register_uninstaller(),
+        "Failed to finalize installation.",
+    )?;
     guard.registered_uninstaller = true;
     dlog!("Uninstaller registered");
 
@@ -413,7 +425,7 @@ async fn install(app: tauri::AppHandle) -> Result<(), String> {
     dlog!("Install complete");
 
     emit_progress(&app, "Launching Grippy...");
-    let app_path = Path::new(config::INSTALL_DIR).join(config::APP_BIN);
+    let app_path = config::app_path();
     dlog!(
         "Spawning {} via explorer.exe (de-elevate)",
         app_path.display()
@@ -432,19 +444,16 @@ async fn install(app: tauri::AppHandle) -> Result<(), String> {
             );
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(config::LAUNCH_SETTLE_MS));
     app.exit(0);
     Ok(())
 }
 
 fn remove_cfa_allowlist() {
-    let service_path = Path::new(config::INSTALL_DIR).join(config::SERVICE_BIN);
-    let app_path = Path::new(config::INSTALL_DIR).join(config::APP_BIN);
-
     let arg = format!(
         "Remove-MpPreference -ControlledFolderAccessAllowedApplications {},{} -ErrorAction SilentlyContinue",
-        shell::ps_single_quote(&service_path.to_string_lossy()),
-        shell::ps_single_quote(&app_path.to_string_lossy()),
+        shell::ps_single_quote(&config::service_path().to_string_lossy()),
+        shell::ps_single_quote(&config::app_path().to_string_lossy()),
     );
 
     dlog!("remove_cfa_allowlist: {arg}");
@@ -482,8 +491,6 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(1);
 }
 
-const WEBVIEW2_RUNTIME_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
-
 fn is_webview2_in_registry() -> bool {
     use winreg::RegKey;
     use winreg::enums::*;
@@ -494,7 +501,7 @@ fn is_webview2_in_registry() -> bool {
             HKEY_LOCAL_MACHINE,
             format!(
                 r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{}",
-                WEBVIEW2_RUNTIME_GUID
+                config::WEBVIEW2_RUNTIME_GUID
             ),
         ),
         (
@@ -502,7 +509,7 @@ fn is_webview2_in_registry() -> bool {
             HKEY_LOCAL_MACHINE,
             format!(
                 r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{}",
-                WEBVIEW2_RUNTIME_GUID
+                config::WEBVIEW2_RUNTIME_GUID
             ),
         ),
         (
@@ -510,7 +517,7 @@ fn is_webview2_in_registry() -> bool {
             HKEY_CURRENT_USER,
             format!(
                 r"Software\Microsoft\EdgeUpdate\Clients\{}",
-                WEBVIEW2_RUNTIME_GUID
+                config::WEBVIEW2_RUNTIME_GUID
             ),
         ),
     ];
@@ -520,7 +527,7 @@ fn is_webview2_in_registry() -> bool {
             Ok(key) => match key.get_value::<String, _>("pv") {
                 Ok(v) => {
                     dlog!("WebView2 registry [{label}]: pv=\"{v}\"");
-                    if !v.is_empty() && v != "0.0.0.0" {
+                    if !v.is_empty() && v != config::WEBVIEW2_NULL_VERSION {
                         return true;
                     }
                 }
@@ -547,26 +554,19 @@ fn is_webview2_on_disk() -> bool {
     }
 
     for dir in &disk_paths {
-        match std::fs::read_dir(dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let ver_dir = entry.path();
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str
-                        .chars()
-                        .next()
-                        .map_or(false, |c| c.is_ascii_digit())
-                    {
-                        let exe = ver_dir.join("msedgewebview2.exe");
-                        if exe.exists() {
-                            dlog!("WebView2 found on disk: {}", exe.display());
-                            return true;
-                        }
-                    }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(|c: char| c.is_ascii_digit()) {
+                let exe = entry.path().join("msedgewebview2.exe");
+                if exe.exists() {
+                    dlog!("WebView2 found on disk: {}", exe.display());
+                    return true;
                 }
             }
-            Err(_) => {}
         }
     }
 
@@ -581,22 +581,20 @@ pub fn is_webview2_present() -> bool {
 }
 
 pub fn bootstrap_webview2() -> Result<(), String> {
-    let tmp = shell::csprng_temp_path("exe")
-        .map_err(|e| format!("Failed to prepare WebView2 download: {e}"))?;
-
     dlog!("bootstrap_webview2: downloading WebView2 bootstrapper");
 
-    if let Err(e) = shell::download_and_verify(config::WEBVIEW2_URL, &tmp) {
+    let locked = shell::download_and_verify(config::WEBVIEW2_URL, "exe").map_err(|e| {
         dlog!("bootstrap_webview2: download/verify failed: {e}");
-        return Err("Failed to download or verify WebView2.".into());
-    }
+        "Failed to download or verify WebView2.".to_string()
+    })?;
 
     dlog!("bootstrap_webview2: running installer...");
-    let tmp_str = tmp.to_string_lossy();
-    let install_result = std::process::Command::new(&*tmp_str)
+    let path_str = locked.path().to_string_lossy().into_owned();
+    let install_result = std::process::Command::new(&path_str)
         .args(["/silent", "/install"])
         .status();
-    let _ = std::fs::remove_file(&tmp);
+
+    drop(locked);
 
     match &install_result {
         Ok(status) if status.success() => dlog!("bootstrap_webview2: install succeeded"),

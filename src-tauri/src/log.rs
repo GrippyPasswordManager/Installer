@@ -6,13 +6,39 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config;
+
 static LOG: std::sync::OnceLock<Mutex<PathBuf>> = std::sync::OnceLock::new();
 
-const MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+pub(crate) struct CivilDate {
+    pub year: i64,
+    pub month: u64,
+    pub day: u64,
+}
 
-fn restrict_dir_acl(dir: &Path) {
+pub(crate) fn civil_date_from_epoch_secs(epoch_secs: u64) -> CivilDate {
+    let days = (epoch_secs / 86400) as i64;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let day_of_era = (z - era * 146097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year = (year_of_era as i64) + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_offset = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_offset + 2) / 5 + 1;
+    let month = if month_offset < 10 {
+        month_offset + 3
+    } else {
+        month_offset - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    CivilDate { year, month, day }
+}
+
+fn restrict_dir_acl(dir: &Path) -> bool {
     let dir_str = dir.to_string_lossy();
-    let _ = crate::shell::system32_command("icacls.exe")
+    match crate::shell::system32_command("icacls.exe")
         .args([
             &*dir_str,
             "/inheritance:r",
@@ -21,27 +47,28 @@ fn restrict_dir_acl(dir: &Path) {
             "/grant:r",
             "Administrators:(OI)(CI)F",
         ])
-        .output();
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        _ => false,
+    }
 }
 
 fn log_dir() -> PathBuf {
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let dir = PathBuf::from(local).join("Grippy").join("logs");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            restrict_dir_acl(&dir);
+        if std::fs::create_dir_all(&dir).is_ok() && restrict_dir_acl(&dir) {
             return dir;
         }
     }
     if let Ok(pdata) = std::env::var("PROGRAMDATA") {
         let dir = PathBuf::from(pdata).join("Grippy").join("logs");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            restrict_dir_acl(&dir);
+        if std::fs::create_dir_all(&dir).is_ok() && restrict_dir_acl(&dir) {
             return dir;
         }
     }
     let dir = std::env::temp_dir().join("Grippy").join("logs");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        restrict_dir_acl(&dir);
+    if std::fs::create_dir_all(&dir).is_ok() && restrict_dir_acl(&dir) {
         return dir;
     }
     std::env::temp_dir()
@@ -50,7 +77,7 @@ fn log_dir() -> PathBuf {
 pub fn sanitize(msg: &str) -> String {
     msg.chars()
         .filter(|c| !c.is_control() && !is_bidi_control(*c))
-        .take(4096)
+        .take(config::SANITIZE_MAX_LENGTH)
         .collect()
 }
 
@@ -67,52 +94,44 @@ fn epoch_secs() -> u64 {
 
 fn timestamp() -> String {
     let secs = epoch_secs();
-    let days = (secs / 86400) as i64;
-    let tod = secs % 86400;
-    let h = tod / 3600;
-    let m = (tod % 3600) / 60;
-    let s = tod % 60;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    let date = civil_date_from_epoch_secs(secs);
 
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        date.year, date.month, date.day, hours, minutes, seconds
+    )
 }
 
 fn parse_line_epoch(line: &str) -> Option<u64> {
     let line = line.strip_prefix('[')?;
-    if line.len() < 19 {
+    if line.len() < 19 || !line.is_char_boundary(19) {
         return None;
     }
-    let year: i64 = line[0..4].parse().ok()?;
+    let year: i64 = line.get(0..4)?.parse().ok()?;
     if line.as_bytes().get(4) != Some(&b'-') {
         return None;
     }
-    let month: u64 = line[5..7].parse().ok()?;
+    let month: u64 = line.get(5..7)?.parse().ok()?;
     if line.as_bytes().get(7) != Some(&b'-') {
         return None;
     }
-    let day: u64 = line[8..10].parse().ok()?;
+    let day: u64 = line.get(8..10)?.parse().ok()?;
     if line.as_bytes().get(10) != Some(&b' ') {
         return None;
     }
-    let h: u64 = line[11..13].parse().ok()?;
+    let h: u64 = line.get(11..13)?.parse().ok()?;
     if line.as_bytes().get(13) != Some(&b':') {
         return None;
     }
-    let m: u64 = line[14..16].parse().ok()?;
+    let m: u64 = line.get(14..16)?.parse().ok()?;
     if line.as_bytes().get(16) != Some(&b':') {
         return None;
     }
-    let s: u64 = line[17..19].parse().ok()?;
+    let s: u64 = line.get(17..19)?.parse().ok()?;
 
     let y = if month <= 2 { year - 1 } else { year };
     let mo = if month <= 2 { month + 9 } else { month - 3 };
@@ -135,7 +154,7 @@ pub fn init() {
         .share_mode(0)
         .open(&path)
     {
-        let cutoff = epoch_secs().saturating_sub(MAX_AGE_SECS);
+        let cutoff = epoch_secs().saturating_sub(config::MAX_LOG_AGE_SECS);
         let mut content = String::new();
         let _ = file.read_to_string(&mut content);
 
@@ -162,11 +181,12 @@ pub fn init() {
 }
 
 pub fn log(msg: &str) {
-    const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
     if let Some(path) = LOG.get() {
         if let Ok(path) = path.lock() {
             if let Ok(mut f) = OpenOptions::new().append(true).open(&*path) {
-                if f.metadata().map_or(true, |m| m.len() < MAX_LOG_BYTES) {
+                if f.metadata()
+                    .map_or(true, |m| m.len() < config::MAX_LOG_BYTES)
+                {
                     let _ = writeln!(f, "[{}] {msg}", timestamp());
                 }
             }
