@@ -15,7 +15,7 @@ sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = [] }
-zip = { version = "7", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 winreg = "0.55"
 sha2 = "0.10"
 windows = { version = "0.62", features = [
