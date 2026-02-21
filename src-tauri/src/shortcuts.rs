@@ -47,14 +47,14 @@ pub fn create() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn remove_preexisting_symlink(path: &Path) {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            dlog!(
-                "shortcuts: removing pre-existing symlink at {}",
-                path.display()
-            );
-            let _ = std::fs::remove_file(path);
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        dlog!(
+            "shortcuts: removing pre-existing symlink at {}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
 

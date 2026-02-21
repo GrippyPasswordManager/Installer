@@ -38,7 +38,7 @@ pub(crate) fn civil_date_from_epoch_secs(epoch_secs: u64) -> CivilDate {
 
 fn restrict_dir_acl(dir: &Path) -> bool {
     let dir_str = dir.to_string_lossy();
-    match crate::shell::system32_command("icacls.exe")
+    matches!(crate::shell::system32_command("icacls.exe")
         .args([
             &*dir_str,
             "/inheritance:r",
@@ -47,11 +47,7 @@ fn restrict_dir_acl(dir: &Path) -> bool {
             "/grant:r",
             "Administrators:(OI)(CI)F",
         ])
-        .output()
-    {
-        Ok(output) if output.status.success() => true,
-        _ => false,
-    }
+        .output(), Ok(output) if output.status.success())
 }
 
 fn log_dir() -> PathBuf {
@@ -151,6 +147,7 @@ pub fn init() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .share_mode(0)
         .open(&path)
     {
@@ -162,10 +159,10 @@ pub fn init() {
         let _ = file.set_len(0);
 
         for line in content.lines() {
-            if let Some(epoch) = parse_line_epoch(line) {
-                if epoch >= cutoff {
-                    let _ = writeln!(file, "{line}");
-                }
+            if let Some(epoch) = parse_line_epoch(line)
+                && epoch >= cutoff
+            {
+                let _ = writeln!(file, "{line}");
             }
         }
 
@@ -181,16 +178,13 @@ pub fn init() {
 }
 
 pub fn log(msg: &str) {
-    if let Some(path) = LOG.get() {
-        if let Ok(path) = path.lock() {
-            if let Ok(mut f) = OpenOptions::new().append(true).open(&*path) {
-                if f.metadata()
-                    .map_or(true, |m| m.len() < config::MAX_LOG_BYTES)
-                {
-                    let _ = writeln!(f, "[{}] {msg}", timestamp());
-                }
-            }
-        }
+    if let Some(path) = LOG.get()
+        && let Ok(path) = path.lock()
+        && let Ok(mut f) = OpenOptions::new().append(true).open(&*path)
+        && f.metadata()
+            .map_or(true, |m| m.len() < config::MAX_LOG_BYTES)
+    {
+        let _ = writeln!(f, "[{}] {msg}", timestamp());
     }
 }
 
@@ -206,3 +200,159 @@ macro_rules! dlog {
     };
 }
 pub(crate) use dlog;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_date_unix_epoch() {
+        let d = civil_date_from_epoch_secs(0);
+        assert_eq!((d.year, d.month, d.day), (1970, 1, 1));
+    }
+
+    #[test]
+    fn civil_date_y2k() {
+        let d = civil_date_from_epoch_secs(946684800);
+        assert_eq!((d.year, d.month, d.day), (2000, 1, 1));
+    }
+
+    #[test]
+    fn civil_date_leap_day_2000() {
+        let d = civil_date_from_epoch_secs(951782400);
+        assert_eq!((d.year, d.month, d.day), (2000, 2, 29));
+    }
+
+    #[test]
+    fn civil_date_leap_day_2024() {
+        let d = civil_date_from_epoch_secs(1709164800);
+        assert_eq!((d.year, d.month, d.day), (2024, 2, 29));
+    }
+
+    #[test]
+    fn civil_date_non_leap_2100_mar_1() {
+        let d = civil_date_from_epoch_secs(4107542400);
+        assert_eq!((d.year, d.month, d.day), (2100, 3, 1));
+    }
+
+    #[test]
+    fn civil_date_end_of_year() {
+        let d = civil_date_from_epoch_secs(1703980800);
+        assert_eq!((d.year, d.month, d.day), (2023, 12, 31));
+    }
+
+    #[test]
+    fn civil_date_recent() {
+        let d = civil_date_from_epoch_secs(1736942400);
+        assert_eq!((d.year, d.month, d.day), (2025, 1, 15));
+    }
+
+    #[test]
+    fn parse_line_epoch_roundtrip() {
+        let epoch: u64 = 1700000000;
+        let time_of_day = epoch % 86400;
+        let h = time_of_day / 3600;
+        let m = (time_of_day % 3600) / 60;
+        let s = time_of_day % 60;
+        let d = civil_date_from_epoch_secs(epoch);
+        let line = format!(
+            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] some log message",
+            d.year, d.month, d.day, h, m, s
+        );
+        assert_eq!(parse_line_epoch(&line), Some(epoch));
+    }
+
+    #[test]
+    fn parse_line_epoch_midnight() {
+        let line = "[2024-06-15 00:00:00] midnight";
+        let result = parse_line_epoch(line).unwrap();
+
+        let d = civil_date_from_epoch_secs(result);
+        assert_eq!((d.year, d.month, d.day), (2024, 6, 15));
+        assert_eq!(result % 86400, 0);
+    }
+
+    #[test]
+    fn parse_line_epoch_end_of_day() {
+        let line = "[2024-06-15 23:59:59] end of day";
+        let result = parse_line_epoch(line).unwrap();
+        let d = civil_date_from_epoch_secs(result);
+        assert_eq!((d.year, d.month, d.day), (2024, 6, 15));
+        assert_eq!(result % 86400, 23 * 3600 + 59 * 60 + 59);
+    }
+
+    #[test]
+    fn parse_line_epoch_missing_bracket() {
+        assert_eq!(parse_line_epoch("2024-06-15 12:00:00] msg"), None);
+    }
+
+    #[test]
+    fn parse_line_epoch_too_short() {
+        assert_eq!(parse_line_epoch("[2024-06-15 12:00"), None);
+    }
+
+    #[test]
+    fn parse_line_epoch_bad_separator() {
+        assert_eq!(parse_line_epoch("[2024/06/15 12:00:00] msg"), None);
+    }
+
+    #[test]
+    fn parse_line_epoch_non_numeric() {
+        assert_eq!(parse_line_epoch("[abcd-ef-gh ij:kl:mn] msg"), None);
+    }
+
+    #[test]
+    fn parse_line_epoch_empty() {
+        assert_eq!(parse_line_epoch(""), None);
+    }
+
+    #[test]
+    fn sanitize_normal_ascii() {
+        assert_eq!(sanitize("hello world 123!"), "hello world 123!");
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        assert_eq!(sanitize("he\0ll\no\tworld\x07"), "helloworld");
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_overrides() {
+        let input = "abc\u{202A}def\u{202E}ghi\u{2066}jkl\u{2069}mno";
+        assert_eq!(sanitize(input), "abcdefghijklmno");
+    }
+
+    #[test]
+    fn sanitize_truncates_at_max_length() {
+        let long = "a".repeat(config::SANITIZE_MAX_LENGTH + 100);
+        let result = sanitize(&long);
+        assert_eq!(result.len(), config::SANITIZE_MAX_LENGTH);
+    }
+
+    #[test]
+    fn sanitize_preserves_emoji() {
+        assert_eq!(sanitize("hello 🎉🔒"), "hello 🎉🔒");
+    }
+
+    #[test]
+    fn sanitize_preserves_cjk() {
+        assert_eq!(sanitize("日本語テスト"), "日本語テスト");
+    }
+
+    #[test]
+    fn sanitize_empty_string() {
+        assert_eq!(sanitize(""), "");
+    }
+
+    #[test]
+    fn sanitize_all_control_chars() {
+        let input: String = (0u8..32).map(|b| b as char).collect();
+        assert_eq!(sanitize(&input), "");
+    }
+
+    #[test]
+    fn sanitize_bidi_attack_pattern() {
+        let input = "admin\u{202E}txt.exe";
+        assert_eq!(sanitize(input), "admintxt.exe");
+    }
+}

@@ -90,13 +90,13 @@ pub fn register_and_start() -> Result<(), Box<dyn std::error::Error>> {
     desc.raw_arg("description");
     desc.raw_arg(config::SERVICE_NAME);
     desc.raw_arg(format!("\"{}\"", config::SERVICE_DESCRIPTION));
-    if let Ok(o) = desc.output() {
-        if !o.status.success() {
-            dlog!(
-                "service::register_and_start: sc description failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-        }
+    if let Ok(o) = desc.output()
+        && !o.status.success()
+    {
+        dlog!(
+            "service::register_and_start: sc description failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
 
     let failure_reset = format!("reset= {}", config::SERVICE_FAILURE_RESET_SECS);
@@ -110,13 +110,13 @@ pub fn register_and_start() -> Result<(), Box<dyn std::error::Error>> {
     fail.raw_arg(config::SERVICE_NAME);
     fail.raw_arg(failure_reset);
     fail.raw_arg(failure_actions);
-    if let Ok(o) = fail.output() {
-        if !o.status.success() {
-            dlog!(
-                "service::register_and_start: sc failure config failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-        }
+    if let Ok(o) = fail.output()
+        && !o.status.success()
+    {
+        dlog!(
+            "service::register_and_start: sc failure config failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
 
     dlog!("service::register_and_start: starting service...");

@@ -113,7 +113,7 @@ pub fn self_elevate() -> Result<(), String> {
         lpVerb: windows::core::w!("runas"),
         lpFile: PCWSTR(exe_wide.as_ptr()),
         lpParameters: PCWSTR(args_wide.as_ptr()),
-        nShow: SW_SHOWNORMAL.0 as i32,
+        nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
 
@@ -640,4 +640,90 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .run(tauri::generate_context!())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_arg_empty_string() {
+        assert_eq!(quote_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn quote_arg_simple_word() {
+        assert_eq!(quote_arg("hello"), "hello");
+    }
+
+    #[test]
+    fn quote_arg_no_special_chars() {
+        assert_eq!(quote_arg("C:\\Program\\file.exe"), "C:\\Program\\file.exe");
+    }
+
+    #[test]
+    fn quote_arg_with_spaces() {
+        assert_eq!(quote_arg("hello world"), "\"hello world\"");
+    }
+
+    #[test]
+    fn quote_arg_with_tab() {
+        assert_eq!(quote_arg("hello\tworld"), "\"hello\tworld\"");
+    }
+
+    #[test]
+    fn quote_arg_with_embedded_quote() {
+        assert_eq!(quote_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn quote_arg_trailing_backslashes() {
+        assert_eq!(quote_arg("path\\\\"), "path\\\\");
+        assert_eq!(quote_arg("a b\\"), "\"a b\\\\\"");
+        assert_eq!(quote_arg("a b\\\\"), "\"a b\\\\\\\\\"");
+    }
+
+    #[test]
+    fn quote_arg_backslashes_before_embedded_quote() {
+        assert_eq!(quote_arg("a\\\"b"), "\"a\\\\\\\"b\"");
+    }
+
+    #[test]
+    fn quote_arg_mixed_backslashes_and_spaces() {
+        assert_eq!(
+            quote_arg("C:\\Program Files\\app"),
+            "\"C:\\Program Files\\app\""
+        );
+    }
+
+    #[test]
+    fn quote_arg_only_spaces() {
+        assert_eq!(quote_arg("   "), "\"   \"");
+    }
+
+    #[test]
+    fn quote_arg_only_quotes() {
+        assert_eq!(quote_arg("\"\"\""), "\"\\\"\\\"\\\"\"");
+    }
+
+    #[test]
+    fn quote_arg_adversarial_nested_quotes() {
+        let input = "he said \"she said \\\"hello\\\"\"";
+        let result = quote_arg(input);
+        assert!(result.starts_with('"') && result.ends_with('"'));
+    }
+
+    #[test]
+    fn quote_arg_all_backslashes() {
+        assert_eq!(quote_arg("\\\\\\"), "\\\\\\");
+    }
+
+    #[test]
+    fn quote_arg_long_string() {
+        let long = "a ".repeat(5000);
+        let result = quote_arg(&long);
+        assert!(result.starts_with('"'));
+        assert!(result.ends_with('"'));
+        assert!(result.len() > 10000);
+    }
 }

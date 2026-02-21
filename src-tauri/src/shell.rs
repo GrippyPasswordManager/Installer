@@ -380,3 +380,51 @@ fn verify_signer_name(state_data: isize, expected: &str) -> Result<(), Box<dyn s
 pub fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ps_single_quote_simple() {
+        assert_eq!(ps_single_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn ps_single_quote_with_single_quote() {
+        assert_eq!(ps_single_quote("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn ps_single_quote_multiple_consecutive_quotes() {
+        assert_eq!(ps_single_quote("a'''b"), "'a''''''b'");
+    }
+
+    #[test]
+    fn ps_single_quote_empty() {
+        assert_eq!(ps_single_quote(""), "''");
+    }
+
+    #[test]
+    fn ps_single_quote_path() {
+        assert_eq!(
+            ps_single_quote(r"C:\Program Files\app.exe"),
+            r"'C:\Program Files\app.exe'"
+        );
+    }
+
+    #[test]
+    fn ps_single_quote_injection_attempt() {
+        assert_eq!(ps_single_quote("'; rm -rf /; '"), "'''; rm -rf /; '''");
+    }
+
+    #[test]
+    fn ps_single_quote_double_quotes_passthrough() {
+        assert_eq!(ps_single_quote("say \"hi\""), "'say \"hi\"'");
+    }
+
+    #[test]
+    fn ps_single_quote_dollar_sign() {
+        assert_eq!(ps_single_quote("$env:PATH"), "'$env:PATH'");
+    }
+}

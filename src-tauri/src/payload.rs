@@ -172,11 +172,11 @@ fn extract_zip(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
             std::fs::create_dir_all(&out_path)?;
             pinned_dirs.push(DirectoryGuard::open_pinned(&out_path)?);
         } else {
-            if let Some(parent) = out_path.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
-                    pinned_dirs.push(DirectoryGuard::open_pinned(parent)?);
-                }
+            if let Some(parent) = out_path.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent)?;
+                pinned_dirs.push(DirectoryGuard::open_pinned(parent)?);
             }
             let mut dest = std::fs::File::create(&out_path)?;
             std::io::copy(&mut file, &mut dest)?;

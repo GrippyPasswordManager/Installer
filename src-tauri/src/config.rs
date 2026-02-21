@@ -66,3 +66,76 @@ pub fn service_path() -> PathBuf {
 pub fn installer_path() -> PathBuf {
     install_dir().join(INSTALLER_BIN)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_path_ends_with_bin() {
+        assert!(app_path().ends_with(APP_BIN));
+    }
+
+    #[test]
+    fn service_path_ends_with_bin() {
+        assert!(service_path().ends_with(SERVICE_BIN));
+    }
+
+    #[test]
+    fn installer_path_ends_with_bin() {
+        assert!(installer_path().ends_with(INSTALLER_BIN));
+    }
+
+    #[test]
+    fn all_paths_start_with_install_dir() {
+        let dir = install_dir();
+        assert!(app_path().starts_with(dir));
+        assert!(service_path().starts_with(dir));
+        assert!(installer_path().starts_with(dir));
+    }
+
+    #[test]
+    fn install_dir_is_absolute() {
+        assert!(install_dir().is_absolute());
+    }
+
+    #[test]
+    fn timeout_constants_positive() {
+        assert!(SERVICE_POLL_INTERVAL_MS > 0);
+        assert!(SERVICE_TEARDOWN_TIMEOUT_SECS > 0);
+        assert!(KILL_APP_SETTLE_MS > 0);
+        assert!(LAUNCH_SETTLE_MS > 0);
+        assert!(DOWNLOAD_INITIAL_BACKOFF_MS > 0);
+    }
+
+    #[test]
+    fn limit_constants_reasonable() {
+        assert!(DOWNLOAD_MAX_ATTEMPTS >= 1 && DOWNLOAD_MAX_ATTEMPTS <= 10);
+        assert!(MAX_ZIP_ENTRIES > 0 && MAX_ZIP_ENTRIES <= 100_000);
+        assert!(MAX_EXTRACTED_BYTES > 0);
+        assert!(MAX_DIRECTORY_DEPTH > 0 && MAX_DIRECTORY_DEPTH <= 256);
+        assert!(MAX_LOG_BYTES > 0);
+        assert!(MAX_LOG_AGE_SECS > 0);
+        assert!(SANITIZE_MAX_LENGTH > 0);
+    }
+
+    #[test]
+    fn service_failure_constants_reasonable() {
+        assert!(SERVICE_FAILURE_RESET_SECS > 0);
+        assert!(SERVICE_FIRST_FAILURE_RESTART_MS > 0);
+        assert!(SERVICE_SECOND_FAILURE_RESTART_MS >= SERVICE_FIRST_FAILURE_RESTART_MS);
+    }
+
+    #[test]
+    fn urls_are_https() {
+        assert!(VCREDIST_URL.starts_with("https://"));
+        assert!(WEBVIEW2_URL.starts_with("https://"));
+    }
+
+    #[test]
+    fn binaries_have_exe_extension() {
+        assert!(APP_BIN.ends_with(".exe"));
+        assert!(SERVICE_BIN.ends_with(".exe"));
+        assert!(INSTALLER_BIN.ends_with(".exe"));
+    }
+}
